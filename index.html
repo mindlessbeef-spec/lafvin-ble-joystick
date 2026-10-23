@@ -64,9 +64,6 @@ const DEADZONE = 12;
 let device = null, characteristic = null, activeMode = 'MANUAL';
 let coords = {x:0,y:0}, heldPointer = null;
 let sending = false, urgentQueue = [], latestControl = null;
-let logCollecting = false, logWireBuffer = '', logCsv = '', logTransferActive = false;
-const LOG_BEGIN = '@@LOG_BEGIN@@';
-const LOG_END = '@@LOG_END@@';
 const $ = id => document.getElementById(id);
 
 function connected(){return !!(device && device.gatt && device.gatt.connected && characteristic)}
@@ -77,7 +74,6 @@ function updateConnectUI(){
   $('disconnect').disabled = !on;
   $('status').textContent = on ? '● CONNECTED' : '● DISCONNECTED';
   $('status').classList.toggle('connected',on);
-  $('getLogs').disabled = !on;
 }
 function updateModeUI(){
   $('manual').classList.toggle('active', activeMode==='MANUAL');
@@ -133,48 +129,9 @@ async function pump(){
   } catch(error){activity('Bluetooth write failed: '+(error.message||error));}
   finally {sending=false}
 }
-function onBleNotification(event){
-  const chunk = new TextDecoder().decode(event.target.value);
-  logWireBuffer += chunk;
-  // Markers may be split across BLE notification packets, so retain the tail.
-  while (logWireBuffer.length) {
-    if (!logCollecting) {
-      const start = logWireBuffer.indexOf(LOG_BEGIN);
-      if (start < 0) {
-        logWireBuffer = logWireBuffer.slice(-LOG_BEGIN.length);
-        return;
-      }
-      logWireBuffer = logWireBuffer.slice(start + LOG_BEGIN.length);
-      if (logWireBuffer.startsWith('\r')) logWireBuffer = logWireBuffer.slice(1);
-      if (logWireBuffer.startsWith('\n')) logWireBuffer = logWireBuffer.slice(1);
-      logCollecting = true;
-      logCsv = '';
-      $('logStatus').textContent = 'Receiving CSV from the SD card…';
-    }
-    const end = logWireBuffer.indexOf(LOG_END);
-    if (end >= 0) {
-      logCsv += logWireBuffer.slice(0, end).replace(/\r?\n$/, '');
-      logWireBuffer = logWireBuffer.slice(end + LOG_END.length);
-      logCollecting = false;
-      logTransferActive = false;
-      $('logPreview').textContent = logCsv.slice(0, 12000) || '(The file is empty.)';
-      $('downloadLogs').disabled = !logCsv || logCsv.startsWith('ERROR:');
-      $('logStatus').textContent = logCsv.startsWith('ERROR:') ? logCsv : 'Transfer complete. ' + logCsv.split(/\r?\n/).length + ' lines received.';
-      continue;
-    }
-    // Keep a possible partial end marker in the wire buffer.
-    const keep = Math.max(0, LOG_END.length - 1);
-    if (logWireBuffer.length > keep) {
-      logCsv += logWireBuffer.slice(0, logWireBuffer.length - keep);
-      logWireBuffer = logWireBuffer.slice(-keep);
-    }
-    return;
-  }
-}
 function onDisconnected(){
   characteristic=null;device=null;urgentQueue=[];latestControl=null;
   resetJoystick(false);activeMode='MANUAL';updateModeUI();updateJoystickUI();updateConnectUI();
-  logCollecting=false;logTransferActive=false;logWireBuffer='';$('logStatus').textContent='Disconnected. Connect again to request logs.';
   activity('Disconnected. Arduino watchdog will stop motors.');
 }
 $('connect').addEventListener('click',async()=>{
@@ -192,13 +149,6 @@ $('connect').addEventListener('click',async()=>{
       throw Error('FFE1 does not report write support; check module UUID configuration.');
     }
     device=chosen;characteristic=found;activeMode='MANUAL';resetJoystick(false);
-    if (found.properties.notify && found.startNotifications) {
-      await found.startNotifications();
-      found.addEventListener('characteristicvaluechanged', onBleNotification);
-      $('logStatus').textContent='Connected. Ready to request SD logs.';
-    } else {
-      $('logStatus').textContent='Connected, but FFE1 does not advertise notifications. SD log display may not work with this BLE module configuration.';
-    }
     updateModeUI();updateConnectUI();
     postUrgent('M\n');postUrgent('J,0,0\n');
     activity('Connected to '+(device.name||'BLE device')+'; MANUAL and STOP sent.');
@@ -228,28 +178,6 @@ $('stop').addEventListener('click',()=>{
   if(connected())postUrgent('S\n');
   else activity('Not connected; robot should remain stopped.');
 });
-$('getLogs').addEventListener('click',()=>{
-  if(!connected()) { $('logStatus').textContent='Connect to the robot first.'; return; }
-  if(!characteristic.properties.notify) {
-    $('logStatus').textContent='FFE1 does not support notifications in this connection; cannot receive log data through this page.';
-    return;
-  }
-  logCollecting=false;logTransferActive=true;logWireBuffer='';logCsv='';
-  latestControl=null;urgentQueue=[];
-  $('logPreview').textContent='Waiting for Arduino…';
-  $('downloadLogs').disabled=true;
-  $('logStatus').textContent='Requesting robot_perf.csv. The robot will stop during transfer.';
-  postUrgent('D\n');
-});
-$('downloadLogs').addEventListener('click',()=>{
-  if(!logCsv)return;
-  const blob=new Blob([logCsv],{type:'text/csv;charset=utf-8'});
-  const url=URL.createObjectURL(blob);
-  const link=document.createElement('a');
-  link.href=url;link.download='robot_perf.csv';link.click();
-  setTimeout(()=>URL.revokeObjectURL(url),1000);
-});
-
 const zone=$('zone');
 function positionFromPointer(e){
   const r=zone.getBoundingClientRect(), cx=r.left+r.width/2, cy=r.top+r.height/2;
@@ -276,7 +204,7 @@ zone.addEventListener('pointerup',release);
 zone.addEventListener('pointercancel',release);
 zone.addEventListener('lostpointercapture',release);
 setInterval(()=>{
-  if(!connected() || logTransferActive)return;
+  if(!connected())return;
   if(activeMode==='MANUAL')postLatest(`J,${coords.x},${coords.y}\n`);
   else postLatest('H\n');
 },SEND_EVERY_MS);
